@@ -12,6 +12,8 @@ from pathlib import Path
 
 import frida
 
+import gspro_connect
+
 # Force line-buffered stdout regardless of how this is launched (a real tty
 # already line-buffers, but anything else -- a wrapper script, a non-tty
 # launch -- silently falls back to full block buffering, which is why shot
@@ -186,18 +188,43 @@ _pending_club = None  # a ClubHeadData payload arrived before its ball data
 _state_lock = threading.Lock()
 
 
+def _forward_shot_to_bridge(shot_number, ball_payload, club_speed_mph):
+    json_str = gspro_connect.build_gspro_json(
+        shot_number=shot_number,
+        ball_speed_mph=mps_to_mph(ball_payload["totalSpeed"]),
+        vla=ball_payload["launchAngle"],
+        hla=ball_payload["horizontalAngle"],
+        total_spin=ball_payload["totalSpin"],
+        spin_axis=ball_payload["spinAxis"],
+        club_speed_mph=club_speed_mph,
+    )
+    try:
+        response = gspro_connect.send_to_bridge(json_str)
+        if response:
+            print(f"[info] bridge response: {response.strip()}")
+        else:
+            print(f"[info] forwarded shot #{shot_number} to bridge (no response)")
+    except OSError as e:
+        print(f"[error] failed to forward shot #{shot_number} to bridge at "
+              f"{gspro_connect.BRIDGE_HOST}:{gspro_connect.BRIDGE_PORT}: {e}")
+
+
 def _print_merged_row(shot_number, ball_payload, club_payload):
+    valid = is_valid_shot(ball_payload)
+    club_speed_mph = club_payload["clubSpeed"] if club_payload else None
     print_shot_table_row(
         shot_number=shot_number,
         ball_speed=ball_payload["totalSpeed"],
-        club_speed=club_payload["clubSpeed"] if club_payload else None,
+        club_speed=club_speed_mph,
         smash_factor=club_payload["smashFactor"] if club_payload else None,
         launch_angle=ball_payload["launchAngle"],
         side_angle=ball_payload["horizontalAngle"],
         spin_axis=ball_payload["spinAxis"],
         total_spin=ball_payload["totalSpin"],
-        valid=is_valid_shot(ball_payload),
+        valid=valid,
     )
+    if valid:
+        _forward_shot_to_bridge(shot_number, ball_payload, club_speed_mph)
 
 
 def _on_grace_period_expired(shot_number):
