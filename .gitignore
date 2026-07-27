@@ -1,0 +1,22 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Third-party binary, not ours to version -- re-download as needed
+automat-lm-bridge-v*
+
+# Session/tooling metadata, not project source
+.claude/
+
+# Reverse-engineering artifacts derived from SkyTrak's own proprietary
+# binary (SkyTrak.app). Large and regenerable -- see reverse-eng/ notes for
+# how to recreate via Il2CppDumper against a local SkyTrak.app install.
+# Not something to redistribute/commit.
+reverse-eng/GameAssembly.arm64.dylib
+reverse-eng/dump/
+reverse-eng/SkyTrakInstrumented.app/
+reverse-eng/Il2CppDumper/
