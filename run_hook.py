@@ -1,9 +1,14 @@
+import plistlib
+import re
+import shutil
 import signal
+import subprocess
 import sys
 import termios
 import threading
 import time
 import traceback
+from pathlib import Path
 
 import frida
 
@@ -14,7 +19,20 @@ import frida
 sys.stdout.reconfigure(line_buffering=True)
 
 PROCESS_NAME = "SKYTRAK"
-SCRIPT_PATH = "hook_shot_data.js"
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_PATH = SCRIPT_DIR / "hook_shot_data.js"
+APPLICATIONS_SKYTRAK_APP = Path("/Applications/SkyTrak.app")
+INSTRUMENTED_APP = SCRIPT_DIR / "reverse-eng" / "SkyTrakInstrumented.app"
+ENTITLEMENTS_PLIST = SCRIPT_DIR / "reverse-eng" / "entitlements.plist"
+GAME_ASSEMBLY_ARM64 = SCRIPT_DIR / "reverse-eng" / "GameAssembly.arm64.dylib"
+DUMP_DIR = SCRIPT_DIR / "reverse-eng" / "dump"
+IL2CPPDUMPER_BIN = SCRIPT_DIR / "reverse-eng" / "Il2CppDumper" / "publish" / "Il2CppDumper"
+
+# The SkyTrak version hook_shot_data.js's hardcoded RVAs were last verified
+# against. Update this after re-verifying against a newer SkyTrak version
+# (see check_for_skytrak_update() below).
+KNOWN_GOOD_SKYTRAK_VERSION = "5.6.14.6.30.25.9"
 
 # MARK: - Shot table output
 
@@ -287,8 +305,204 @@ def _attach_with_watchdog(device, pid, warn_after=8.0):
     return result["session"]
 
 
+# MARK: - SkyTrak update / RVA verification
+#
+# SkyTrakInstrumented.app is a static, re-signed copy made at some point in
+# time -- it doesn't track /Applications/SkyTrak.app's auto-updates. Worse,
+# a new SkyTrak build can shift the native code addresses (RVAs) hardcoded
+# in hook_shot_data.js, silently breaking or crashing the hooks. This
+# section detects both situations at startup.
+
+def get_bundle_version(app_path):
+    info_plist = app_path / "Contents" / "Info.plist"
+    if not info_plist.exists():
+        return None
+    with open(info_plist, "rb") as f:
+        info = plistlib.load(f)
+    return info.get("CFBundleShortVersionString")
+
+
+def prompt_yes_no(question):
+    return input(f"{question} [y/N]: ").strip().lower() == "y"
+
+
+def resign_instrumented_app():
+    print(f"[info] re-signing {INSTRUMENTED_APP.name} with debug entitlements...")
+    subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-",
+         "--entitlements", str(ENTITLEMENTS_PLIST), str(INSTRUMENTED_APP)],
+        check=True,
+    )
+
+
+def refresh_instrumented_app():
+    print(f"[info] copying {APPLICATIONS_SKYTRAK_APP} -> {INSTRUMENTED_APP} "
+          "(large app bundle, can take a minute)...")
+    if INSTRUMENTED_APP.exists():
+        shutil.rmtree(INSTRUMENTED_APP)
+    subprocess.run(["cp", "-R", str(APPLICATIONS_SKYTRAK_APP), str(INSTRUMENTED_APP)], check=True)
+    print("[info] stripping quarantine attributes...")
+    subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(INSTRUMENTED_APP)], check=False)
+    subprocess.run(["xattr", "-dr", "com.apple.provenance", str(INSTRUMENTED_APP)], check=False)
+    resign_instrumented_app()
+    print("[info] SkyTrakInstrumented.app refreshed and re-signed. "
+          "Quit and relaunch it if it's currently running.")
+
+
+# Method -> (containing class, signature to locate it by). Keep in sync with
+# the RVA_* constants hook_shot_data.js actually hooks.
+RVA_TARGETS = {
+    "RVA_ON_SHOT_BALL_DATA": ("SecurityWrapperService", "private void OnShotBallData(STSWShotParamsType shotParams)"),
+    "RVA_ON_SHOT_ENDED": ("SecurityWrapperService", "private void OnShotEnded(STSWShotParamsType shotParams)"),
+    "RVA_PREDICT_CLUB_HEAD_DATA": ("ClubHeadData", "public void PredictClubHeadData(TFlightData flightData, string clubType, bool isPracticeMode)"),
+}
+
+_RVA_CONST_PATTERN = re.compile(r'const\s+(RVA_\w+)\s*=\s*(0x[0-9A-Fa-f]+)')
+# (?!\.) rejects Il2CppDumper's dotted nested-type entries (e.g. a top-level
+# "class SecurityWrapperService.GetBoxEnvironmentCommand" would otherwise
+# satisfy "class {}\b" too, since \b only checks a word/non-word transition
+# and "." qualifies -- matching the wrong, unrelated class entirely).
+_CLASS_PATTERN_TEMPLATE = r'^\s*(?:public |internal |private )?(?:sealed |abstract )?class {}(?!\.)\b[^\n]*\n\{{\n'
+_RVA_COMMENT_PATTERN = re.compile(r'RVA:\s*(0x[0-9A-Fa-f]+)')
+
+
+def read_hardcoded_rvas():
+    source = SCRIPT_PATH.read_text()
+    return {name: int(value, 16) for name, value in _RVA_CONST_PATTERN.findall(source)}
+
+
+def find_method_rva(dump_text, class_name, signature):
+    # Il2CppDumper flattens nested types into separate top-level entries, so
+    # a class's body never contains another class's braces -- the first
+    # standalone "}" on its own line reliably closes it.
+    class_pattern = re.compile(_CLASS_PATTERN_TEMPLATE.format(re.escape(class_name)), re.MULTILINE)
+    class_match = class_pattern.search(dump_text)
+    if not class_match:
+        return None
+    body_end = dump_text.find("\n}\n", class_match.end())
+    if body_end == -1:
+        return None
+    class_body = dump_text[class_match.end():body_end]
+
+    sig_index = class_body.find(signature)
+    if sig_index == -1:
+        return None
+    preceding = class_body[max(0, sig_index - 200):sig_index]
+    # The window can contain more than one method's RVA comment -- take the
+    # last (closest to the signature), not the first.
+    comment_matches = list(_RVA_COMMENT_PATTERN.finditer(preceding))
+    return int(comment_matches[-1].group(1), 16) if comment_matches else None
+
+
+def check_rva_drift():
+    if not IL2CPPDUMPER_BIN.exists():
+        print(f"[warn] Il2CppDumper not found at {IL2CPPDUMPER_BIN} -- "
+              "skipping RVA verification. See README.md to build it.")
+        return
+
+    print("[info] thinning GameAssembly.dylib to arm64...")
+    lipo = subprocess.run(
+        ["lipo", "-thin", "arm64",
+         str(INSTRUMENTED_APP / "Contents" / "Frameworks" / "GameAssembly.dylib"),
+         "-output", str(GAME_ASSEMBLY_ARM64)],
+        capture_output=True, text=True,
+    )
+    if lipo.returncode != 0:
+        print(f"[error] lipo failed, skipping RVA verification: {lipo.stderr}")
+        return
+
+    print("[info] running Il2CppDumper (this can take a minute)...")
+    if DUMP_DIR.exists():
+        shutil.rmtree(DUMP_DIR)
+    DUMP_DIR.mkdir(parents=True)
+    metadata_path = (INSTRUMENTED_APP / "Contents" / "Resources" / "Data" /
+                      "il2cpp_data" / "Metadata" / "global-metadata.dat")
+    dumper = subprocess.run(
+        [str(IL2CPPDUMPER_BIN), str(GAME_ASSEMBLY_ARM64), str(metadata_path), str(DUMP_DIR)],
+        capture_output=True, text=True,
+    )
+    dump_cs_path = DUMP_DIR / "dump.cs"
+    if not dump_cs_path.exists():
+        # Il2CppDumper prints "Press any key to exit..." and errors trying to
+        # ReadKey with no console attached at the very end -- harmless, the
+        # dump itself has already been written by that point. Only treat it
+        # as a real failure if dump.cs never showed up.
+        print(f"[error] Il2CppDumper did not produce dump.cs -- skipping RVA "
+              f"verification.\n{dumper.stdout}\n{dumper.stderr}")
+        return
+
+    dump_text = dump_cs_path.read_text(errors="replace")
+    hardcoded = read_hardcoded_rvas()
+
+    print("[info] RVA check results:")
+    any_changed = False
+    for const_name, (class_name, signature) in RVA_TARGETS.items():
+        new_rva = find_method_rva(dump_text, class_name, signature)
+        old_rva = hardcoded.get(const_name)
+        if new_rva is None:
+            print(f"  {const_name}: could not find {class_name}.{signature} in "
+                  "the new dump -- check hook_shot_data.js manually")
+            any_changed = True
+        elif old_rva is None:
+            print(f"  {const_name}: not defined in hook_shot_data.js to compare against")
+        elif new_rva != old_rva:
+            print(f"  {const_name}: CHANGED old=0x{old_rva:X} new=0x{new_rva:X} "
+                  "-- update hook_shot_data.js")
+            any_changed = True
+        else:
+            print(f"  {const_name}: unchanged (0x{old_rva:X})")
+
+    if any_changed:
+        print("[warn] one or more RVAs changed or couldn't be verified -- "
+              "hook_shot_data.js needs manual review before this bridge can "
+              "be trusted on this SkyTrak version.")
+    else:
+        print("[info] all RVAs match -- hook_shot_data.js should still be valid.")
+
+
+def check_for_skytrak_update():
+    if not APPLICATIONS_SKYTRAK_APP.exists():
+        print(f"[warn] {APPLICATIONS_SKYTRAK_APP} not found -- skipping update check")
+        if not INSTRUMENTED_APP.exists():
+            print(f"[error] {INSTRUMENTED_APP} does not exist either. See README.md for setup.")
+            sys.exit(1)
+        return
+
+    installed_version = get_bundle_version(APPLICATIONS_SKYTRAK_APP)
+    instrumented_version = get_bundle_version(INSTRUMENTED_APP) if INSTRUMENTED_APP.exists() else None
+    print(f"[info] /Applications/SkyTrak.app version: {installed_version}")
+    print(f"[info] SkyTrakInstrumented.app version:   {instrumented_version or '(not set up yet)'}")
+
+    if installed_version != instrumented_version:
+        if instrumented_version is None:
+            question = "SkyTrakInstrumented.app hasn't been set up yet. Create it now from /Applications/SkyTrak.app?"
+        else:
+            question = f"SkyTrak.app has been updated ({instrumented_version} -> {installed_version}). Update SkyTrakInstrumented.app to match?"
+
+        if prompt_yes_no(question):
+            refresh_instrumented_app()
+            check_rva_drift()
+            instrumented_version = get_bundle_version(INSTRUMENTED_APP)
+        elif instrumented_version is None:
+            print("[error] cannot continue without SkyTrakInstrumented.app. See README.md for setup.")
+            sys.exit(1)
+        else:
+            print("[info] continuing with the existing SkyTrakInstrumented.app.")
+
+    if instrumented_version != KNOWN_GOOD_SKYTRAK_VERSION:
+        print(
+            f"[warn] SkyTrakInstrumented.app is version {instrumented_version}, but "
+            f"this bridge's hooks were last verified against {KNOWN_GOOD_SKYTRAK_VERSION}. "
+            "The RVAs in hook_shot_data.js may be stale for this version."
+        )
+    else:
+        print(f"[info] SkyTrakInstrumented.app version matches the known-good version ({KNOWN_GOOD_SKYTRAK_VERSION}).")
+
+
 def main():
     global _active_session
+
+    check_for_skytrak_update()
 
     print("[info] enumerating processes...")
     device = frida.get_local_device()
