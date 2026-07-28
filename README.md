@@ -1,36 +1,36 @@
 # SkyTrak GSPro Connect Bridge
 
-Reads live shot data directly out of SkyTrak's own running app (via [Frida](https://frida.re/)
-instrumentation of its Unity/IL2CPP internals). Data is available the instant it's computed by the Skytrak app.
+On Apple Silicon devices, reads live shot data directly out of SkyTrak's own running app (via [Frida](https://frida.re/)
+instrumentation of its Unity/IL2CPP internals). Data is available the instant it's computed by the 
+Skytrak app.
 
 Speaks the [GSPro Open Connect](https://gsprogolf.com/GSProConnectV1.html) protocol on port 921
 -- the same local JSON protocol [automat.golf](https://automat.golf) picks up via
-`automat-lm-bridge`.
+`automat-lm-bridge` (downloaded directly from automat.golf).
 
 **Status:** live shot capture works, prints to a table in your terminal, and forwards each valid
 shot as GSPro Open Connect JSON to `automat-lm-bridge` on `127.0.0.1:921`.
 
 ## TL;DR
 
-1. Run `automat-lm-bridge` (get it from automat.golf).
+1. Run `automat-lm-bridge` in a terminal.
 2. Double-click **`run.command`** (or run `./run.command` in a terminal). It installs anything it
    needs (Homebrew, Python, the venv, `frida-tools`), launches `SkyTrakInstrumented.app` if it's
    not already running, and starts the bridge -- on a first run it'll also offer to set up
-   `SkyTrakInstrumented.app` itself, answer `y`. See One-time setup below if anything about that
+   `SkyTrakInstrumented.app` itself, answer `y`. See one-time setup below if anything about that
    needs more explanation.
-3. Connect SkyTrak to your unit as usual.
-4. Hit balls. Shots print live in your terminal and forward automatically to automat.golf.
-5. Use **Chrome**, not Safari, for automat.golf -- Safari blocks it (see Troubleshooting).
-6. Ctrl+C to stop.
+3. Connect your SkyTrak LM to the app as usual.
+4. Open [automat.golf](https://automat.golf) in **Chrome or Firefox** (not Safari, it blocks HTTP; see the Troubleshooting section for details), and load a course.
+5. Hit balls. Shots print live in your terminal and forward automatically to [automat.golf](https://automat.golf).
+6. Press Ctrl+C in the terminal window to stop the both the automat and run.command bridges.
 
 ## Requirements
 
 - macOS, Apple Silicon
-- OG SkyTrak launch monitor (Skytrak+ not tested) and the SkyTrak app installed in `/Applications`
-- Everything else (Homebrew, Xcode command line tools, Python 3.12) is installed automatically by
-  `run.command` if it isn't already present.
+- OG SkyTrak launch monitor (Skytrak+ not tested, but may work) and the SkyTrak app installed in `/Applications`
+- Everything else (Homebrew, Xcode command line tools, Python 3.12) is installed automatically by `run.command` if it isn't already present.
 
-## One-time setup
+## One-time setup (contributing)
 
 ```bash
 git clone git@github.com:cohenadair/skytrak-gspro-connect-bridge.git
