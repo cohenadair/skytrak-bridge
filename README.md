@@ -10,6 +10,20 @@ Speaks the [GSPro Open Connect](https://gsprogolf.com/GSProConnectV1.html) proto
 **Status:** live shot capture works, prints to a table in your terminal, and forwards each valid
 shot as GSPro Open Connect JSON to `automat-lm-bridge` on `127.0.0.1:921`.
 
+## TL;DR
+
+Already done the one-time setup below? Here's the whole day-to-day flow:
+
+1. Run `automat-lm-bridge` (get it from automat.golf).
+2. Launch `reverse-eng/SkyTrakInstrumented.app` -- **not** the real SkyTrak app -- and connect it
+   to your unit as usual.
+3. `./venv/bin/python3 run_hook.py`
+4. Hit balls. Shots print live in your terminal and forward automatically to automat.golf.
+5. Use **Chrome**, not Safari, for automat.golf -- Safari blocks it (see Troubleshooting).
+6. Ctrl+C to stop.
+
+Haven't set up yet? Start at One-time setup below.
+
 ## Requirements
 
 - macOS, Apple Silicon
