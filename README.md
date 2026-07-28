@@ -12,94 +12,85 @@ shot as GSPro Open Connect JSON to `automat-lm-bridge` on `127.0.0.1:921`.
 
 ## TL;DR
 
-Already done the one-time setup below? Here's the whole day-to-day flow:
-
 1. Run `automat-lm-bridge` (get it from automat.golf).
-2. Launch `reverse-eng/SkyTrakInstrumented.app` -- **not** the real SkyTrak app -- and connect it
-   to your unit as usual.
-3. `./venv/bin/python3 run_hook.py`
+2. Double-click **`run.command`** (or run `./run.command` in a terminal). It installs anything it
+   needs (Homebrew, Python, the venv, `frida-tools`), launches `SkyTrakInstrumented.app` if it's
+   not already running, and starts the bridge -- on a first run it'll also offer to set up
+   `SkyTrakInstrumented.app` itself, answer `y`. See One-time setup below if anything about that
+   needs more explanation.
+3. Connect SkyTrak to your unit as usual.
 4. Hit balls. Shots print live in your terminal and forward automatically to automat.golf.
 5. Use **Chrome**, not Safari, for automat.golf -- Safari blocks it (see Troubleshooting).
 6. Ctrl+C to stop.
-
-Haven't set up yet? Start at One-time setup below.
 
 ## Requirements
 
 - macOS, Apple Silicon
 - OG SkyTrak launch monitor (Skytrak+ not tested) and the SkyTrak app installed in `/Applications`
-- Xcode command line tools (for `codesign`, `lipo`, `xattr`)
-- [Homebrew](https://brew.sh)
-- [.NET SDK](https://dotnet.microsoft.com/) (to build Il2CppDumper)
-- Python 3.10+ (macOS's built-in `python3` is 3.9, too old for `frida-tools` --
-  `brew install python@3.12` if needed)
+- Everything else (Homebrew, Xcode command line tools, Python 3.12) is installed automatically by
+  `run.command` if it isn't already present.
 
 ## One-time setup
 
-1. Clone this repo and set up a virtualenv:
+```bash
+git clone git@github.com:cohenadair/skytrak-gspro-connect-bridge.git
+cd skytrak-gspro-connect-bridge
+./run.command
+```
 
-   ```bash
-   git clone git@github.com:cohenadair/skytrak-gspro-connect-bridge.git
-   cd skytrak-gspro-connect-bridge
-   /opt/homebrew/bin/python3.12 -m venv venv
-   ./venv/bin/pip install --upgrade pip
-   ./venv/bin/pip install frida-tools
-   ```
+`run.command` checks for Homebrew, Xcode command line tools, Python 3.12, and a working
+`frida-tools` install, installing whichever of those are missing (skipping any that are already
+there -- safe to run repeatedly, and it's also just how you start the bridge day to day). It then
+runs the bridge itself, which on a first run detects that `SkyTrakInstrumented.app` (the re-signed
+working copy Frida actually attaches to) doesn't exist yet and offers to create it automatically --
+answer `y`. This copies `/Applications/SkyTrak.app` into `reverse-eng/SkyTrakInstrumented.app`,
+strips its quarantine flag, and re-signs it with the entitlements Frida needs to attach
+(`reverse-eng/entitlements.plist`). The original app, and Apple's signature on it, are left
+completely untouched. This step requires SkyTrak already installed normally in `/Applications` and
+run once so it's paired with your launch monitor as usual.
 
-2. Build [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) -- used to verify SkyTrak's
-   internal function addresses haven't shifted after an update:
+If macOS prompts for Screen Recording or other permissions, grant them to
+`SkyTrakInstrumented.app` the same way you would for the real app.
 
-   ```bash
-   git clone --depth 1 https://github.com/Perfare/Il2CppDumper.git reverse-eng/Il2CppDumper
-   dotnet publish reverse-eng/Il2CppDumper/Il2CppDumper/Il2CppDumper.csproj \
-     -c Release -f net8.0 -r osx-arm64 --self-contained true \
-     -o reverse-eng/Il2CppDumper/publish
-   ```
+If Xcode command line tools weren't already installed, `run.command` launches Apple's own
+installer and stops -- complete that, then run `run.command` again.
 
-3. Install SkyTrak normally (`/Applications/SkyTrak.app`) and run it once so it's paired with
-   your launch monitor as usual.
+### Optional: RVA-drift verification
 
-4. Run the bridge. On first run it detects that `SkyTrakInstrumented.app` (the re-signed working
-   copy Frida actually attaches to) doesn't exist yet and offers to create it automatically:
+`run.command` doesn't build [Il2CppDumper](https://github.com/Perfare/Il2CppDumper), which is only
+used to verify SkyTrak's internal function addresses haven't shifted after an update (see Updating
+SkyTrak below) -- skipping it just means that specific check is skipped too; everything else works
+the same. To enable it, install the [.NET SDK](https://dotnet.microsoft.com/) and build it by hand:
 
-   ```bash
-   ./venv/bin/python3 run_hook.py
-   ```
-
-   Answer `y` when prompted. This copies `/Applications/SkyTrak.app` into
-   `reverse-eng/SkyTrakInstrumented.app`, strips its quarantine flag, and re-signs it with the
-   entitlements Frida needs to attach (`reverse-eng/entitlements.plist`). The original app, and
-   Apple's signature on it, are left completely untouched.
-
-5. If macOS prompts for Screen Recording or other permissions, grant them to
-   `SkyTrakInstrumented.app` the same way you would for the real app.
+```bash
+git clone --depth 1 https://github.com/Perfare/Il2CppDumper.git reverse-eng/Il2CppDumper
+dotnet publish reverse-eng/Il2CppDumper/Il2CppDumper/Il2CppDumper.csproj \
+  -c Release -f net8.0 -r osx-arm64 --self-contained true \
+  -o reverse-eng/Il2CppDumper/publish
+```
 
 ## Day-to-day use
 
-1. Launch `reverse-eng/SkyTrakInstrumented.app` -- **not** the app in `/Applications`. Frida
-   can't attach to the real one; it's missing the debug entitlement `SkyTrakInstrumented.app` was
-   re-signed with (Hardened Runtime blocks `task_for_pid()` without it). Don't run both at once
-   -- they'll fight over the connection to your SkyTrak unit.
+1. Double-click `run.command`, or run `./run.command` in a terminal from the repo root. It
+   launches `SkyTrakInstrumented.app` for you if it's not already running -- **not** the app in
+   `/Applications`; Frida can't attach to that one, since it's missing the debug entitlement
+   `SkyTrakInstrumented.app` was re-signed with (Hardened Runtime blocks `task_for_pid()` without
+   it). Don't run the real app at the same time -- they'll fight over the connection to your
+   SkyTrak unit.
 2. Connect it to your SkyTrak unit as usual.
-3. In a terminal:
-
-   ```bash
-   cd skytrak-gspro-connect-bridge
-   ./venv/bin/python3 run_hook.py
-   ```
-
-4. On startup, the script checks whether `/Applications/SkyTrak.app` has been updated since
+3. On startup, the script checks whether `/Applications/SkyTrak.app` has been updated since
    `SkyTrakInstrumented.app` was last refreshed. If so, it'll ask:
 
    ```
    SkyTrak.app has been updated (5.6.14.6.30.25.9 -> 5.7.0.0.1.2.3). Update SkyTrakInstrumented.app to match? [y/N]
    ```
 
-   - **Yes**: re-copies and re-signs `SkyTrakInstrumented.app`, then re-runs Il2CppDumper and
-     checks whether the hardcoded function addresses (RVAs) in `hook_shot_data.js` still point
-     at the right code. If any have moved, it prints exactly which ones changed -- that means
-     `hook_shot_data.js` needs manual updating (new RVAs, and possibly re-checked struct field
-     offsets) before the bridge can be trusted on the new version.
+   - **Yes**: re-copies and re-signs `SkyTrakInstrumented.app`, then (if Il2CppDumper is set up --
+     see "Optional: RVA-drift verification" above) re-runs it and checks whether the hardcoded
+     function addresses (RVAs) in `hook_shot_data.js` still point at the right code. If any have
+     moved, it prints exactly which ones changed -- that means `hook_shot_data.js` needs manual
+     updating (new RVAs, and possibly re-checked struct field offsets) before the bridge can be
+     trusted on the new version.
    - **No**: keeps using the existing `SkyTrakInstrumented.app` as-is.
 
    It also always logs a warning if `SkyTrakInstrumented.app`'s version doesn't match
@@ -107,7 +98,7 @@ Haven't set up yet? Start at One-time setup below.
    bridge's hooks were actually verified against. Update it by hand once you've confirmed a newer
    version still works correctly.
 
-5. Hit some shots. You'll see a live table like:
+4. Hit some shots. You'll see a live table like:
 
    ```
    ---------------------------------------------------------------------------------------------------------
@@ -120,7 +111,7 @@ Haven't set up yet? Start at One-time setup below.
    swing (e.g. it was moved out of the hitting area mid-detection) -- shown for visibility, but
    not valid shots.
 
-6. Ctrl+C to stop. The bridge detaches from SkyTrak cleanly and prints a closing border.
+5. Ctrl+C to stop. The bridge detaches from SkyTrak cleanly and prints a closing border.
 
 ## Forwarding to automat.golf
 
@@ -163,7 +154,7 @@ To test end to end:
 
 ## Updating SkyTrak
 
-If SkyTrak auto-updates itself, just run `run_hook.py` as normal -- it detects the version change
+If SkyTrak auto-updates itself, just run `run.command` as normal -- it detects the version change
 and walks you through refreshing `SkyTrakInstrumented.app`, as described above.
 
 ## Troubleshooting
@@ -186,6 +177,8 @@ and walks you through refreshing `SkyTrakInstrumented.app`, as described above.
 
 ## Repo layout
 
+- `run.command` -- installs prerequisites (if missing), launches `SkyTrakInstrumented.app` (if not
+  already running), and starts the bridge; the normal way to run this day to day.
 - `run_hook.py` -- the bridge: attaches to SkyTrak, prints live shot data, forwards valid shots to
   `automat-lm-bridge`, handles SkyTrak-update/RVA-drift detection.
 - `hook_shot_data.js` -- the Frida script with the actual hooks
