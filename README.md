@@ -4,25 +4,28 @@ On Apple Silicon devices, reads live shot data directly out of SkyTrak's own run
 instrumentation of its Unity/IL2CPP internals). Data is available the instant it's computed by the 
 Skytrak app.
 
-Speaks the [GSPro Open Connect](https://gsprogolf.com/GSProConnectV1.html) protocol on port 921
--- the same local JSON protocol [automat.golf](https://automat.golf) picks up via
-`automat-lm-bridge` (downloaded directly from automat.golf).
+Speaks the [GSPro Open Connect](https://gsprogolf.com/GSProConnectV1.html) protocol, sending shots
+to **[Muni Golf](https://munigolfsim.com)** -- a native Mac golf sim that listens for Open Connect
+launch monitors on the port it shows in-game (9210 unless you change it). The bridge keeps one
+connection open with periodic heartbeats, like real launch monitor software does, and reconnects
+automatically if the game is closed/reopened.
 
-**Status:** live shot capture works, prints to a table in your terminal, and forwards each valid
-shot as GSPro Open Connect JSON to `automat-lm-bridge` on `127.0.0.1:921`.
+**Status:** live shot capture works and prints to a table in your terminal. Forwarding to Muni
+Golf is implemented to the Open Connect spec but not yet verified against the game itself.
 
 ## TL;DR
 
-1. Run `automat-lm-bridge` in a terminal.
+1. Open Muni Golf and note the Open Connect port it shows (9210 by default).
 2. Double-click **`run.command`** (or run `./run.command` in a terminal). It installs anything it
    needs (Homebrew, Python, the venv, `frida-tools`), launches `SkyTrakInstrumented.app` if it's
    not already running, and starts the bridge -- on a first run it'll also offer to set up
    `SkyTrakInstrumented.app` itself, answer `y`. See one-time setup below if anything about that
-   needs more explanation.
+   needs more explanation. If Muni uses a port other than 9210, run `./run.command --port <port>`.
+   Using the SkyTrak app on its own, without Muni? Run `./run.command --software skytrak` instead
+   (see "Using SkyTrak's app on its own" below).
 3. Connect your SkyTrak LM to the app as usual.
-4. Open [automat.golf](https://automat.golf) in **Chrome or Firefox** (not Safari, it blocks HTTP; see the Troubleshooting section for details), and load a course.
-5. Hit balls. Shots print live in your terminal and forward automatically to [automat.golf](https://automat.golf).
-6. Press Ctrl+C in the terminal window to stop the both the automat and run.command bridges.
+4. Hit balls. Shots print live in your terminal and forward automatically to Muni Golf.
+5. Press Ctrl+C in the terminal window to stop the bridge.
 
 ## Requirements
 
@@ -82,15 +85,16 @@ dotnet publish reverse-eng/Il2CppDumper/Il2CppDumper/Il2CppDumper.csproj \
    `SkyTrakInstrumented.app` was last refreshed. If so, it'll ask:
 
    ```
-   SkyTrak.app has been updated (5.6.14.6.30.25.9 -> 5.7.0.0.1.2.3). Update SkyTrakInstrumented.app to match? [y/N]
+   SkyTrak.app has been updated (5.8.27.11.10.25.10 -> 6.2.111.10.7.26.11). Update SkyTrakInstrumented.app to match? [y/N]
    ```
 
    - **Yes**: re-copies and re-signs `SkyTrakInstrumented.app`, then (if Il2CppDumper is set up --
      see "Optional: RVA-drift verification" above) re-runs it and checks whether the hardcoded
-     function addresses (RVAs) in `hook_shot_data.js` still point at the right code. If any have
-     moved, it prints exactly which ones changed -- that means `hook_shot_data.js` needs manual
-     updating (new RVAs, and possibly re-checked struct field offsets) before the bridge can be
-     trusted on the new version.
+     function addresses (RVAs) and `ClubHeadData` field offsets in `hook_shot_data.js` still
+     match. If any have moved, it prints exactly which ones changed -- that means
+     `hook_shot_data.js` needs manual updating before the bridge can be trusted on the new
+     version. (The shot-struct offsets inside `STSWShotParamsType` aren't auto-checked; compare
+     them against `reverse-eng/dump/dump.cs` by hand after a major update.)
    - **No**: keeps using the existing `SkyTrakInstrumented.app` as-is.
 
    It also always logs a warning if `SkyTrakInstrumented.app`'s version doesn't match
@@ -113,26 +117,75 @@ dotnet publish reverse-eng/Il2CppDumper/Il2CppDumper/Il2CppDumper.csproj \
 
 5. Ctrl+C to stop. The bridge detaches from SkyTrak cleanly and prints a closing border.
 
-## Forwarding to automat.golf
+## Using SkyTrak's app on its own
 
-Each valid shot (see the "no ball data" note above) is sent as GSPro Open Connect JSON over a
-fresh TCP connection to `127.0.0.1:921`, where `automat-lm-bridge` (run separately -- get it from
-automat.golf) picks it up and forwards it on to the automat.golf web app -- the same local
-port/protocol GSPro itself listens on. `run_hook.py` prints the bridge's response (or a clear
-error if the connection fails) right after each row.
-
-`automat-lm-bridge` also serves a status page at `http://127.0.0.1:9091/` -- useful for confirming
-it's up and seeing connection/shot status without needing automat.golf itself open. If shots
-print in the table but never show up there, check that `automat-lm-bridge` is actually running.
-
-### Testing without a launch monitor
-
-`send_test_shot.py` sends synthetic shots to the same port/protocol without needing SkyTrak or
-Frida involved at all -- useful for testing the network path (or automat.golf/GSPro's receiving
-end) in isolation:
+By default the bridge assumes you're playing Muni Golf (`--software muni`). If you're only using
+SkyTrak's own app, run:
 
 ```bash
-./venv/bin/python3 send_test_shot.py
+./run.command --software skytrak
+```
+
+Shots still print in the table, and the SkyTrak-side putting fixes still apply (the side-angle
+clamp and re-sending putting mode after a reconnect). Nothing is sent to Muni, though: the bridge
+doesn't try to connect to it, prints no Muni warnings, and doesn't switch SkyTrak's putting mode
+to follow Muni's club. Bad reads show as `(no ball data)`, without the "not forwarded" note.
+`--host` and `--port` are ignored in this mode.
+
+## Forwarding to Muni Golf
+
+Each valid shot is sent as GSPro Open Connect JSON to Muni Golf at `127.0.0.1:9210`
+over a single long-lived connection, with a heartbeat (`IsHeartBeat: true`,
+`LaunchMonitorIsReady: true`) every 5 seconds so the game sees the launch monitor as connected and
+ready. If the game isn't running yet, the bridge prints a warning once and keeps retrying in the
+background; shots hit while disconnected print `[error] failed to forward ...` and are dropped.
+`--host`/`--port` override the address (e.g. Muni running on another Mac on your network).
+
+Set `DEBUG_ENABLED = True` in `run_hook.py` to print everything Muni sends back.
+
+### Putting side-angle cap
+
+SkyTrak's side angle (HLA) on putts is unreliable, so on putts it's forced to 0° (dead straight)
+in two places:
+
+- **Muni Golf**: when Muni reports the putter is out (its Code 201 "Player Information" messages
+  include `"Club":"PT"`), the side angle sent to the game is clamped to ±`PUTTING_SIDE_CAP` in
+  `gspro_connect.py` (currently 0). The shot table still shows SkyTrak's own number, with a
+  `(putt: side sent as 0.0)` note on rows where the cap changed it.
+- **SkyTrak itself**: when the SkyTrak app is in putting mode, `hook_shot_data.js` clamps the
+  side angle to ±`PUTTING_SIDE_CAP` (also 0, set separately in that file) inside SkyTrak's own
+  shot data, before SkyTrak reads it, so its display and ball flight are straight too. This only
+  happens while the bridge is attached. Rows where it changed the value get a
+  `(putt: SkyTrak side set to 0.0)` note (combined with the Muni note when both apply, e.g.
+  `(putt: side sent as 0.0; SkyTrak side set to 0.0)`).
+
+The bridge also keeps SkyTrak's shot mode in step with Muni: when Muni reports the putter is out,
+it switches SkyTrak to putting mode (the same switch SkyTrak's own UI makes, which also puts the
+unit itself into putting mode), and back to normal mode when you pick another club. You'll see an
+`[info] Switched from normal to putting` line when it does. It only acts when Muni's club changes,
+so you can still change SkyTrak's mode by hand in between. Turn it off with
+`AUTO_SWITCH_SKYTRAK_PUTTING_MODE` in `run_hook.py`.
+
+SkyTrak sometimes drops its connection to the unit mid-session and reconnects on its own. The unit
+comes back without putting mode, but SkyTrak still thinks it's in putting mode, so it never
+re-sends it and putts stop registering. To fix this, the bridge waits 3 seconds after every
+reconnect and then switches SkyTrak to the other mode and back again. That's the same as picking
+a non-putter club in Muni and then the putter. You'll see `[info] SkyTrak reconnected to the unit
+-- re-sending putting mode`, followed by `Switched from putting to normal` and
+`Switched from normal to putting`. Turn it off with
+`REAPPLY_SHOT_MODE_ON_RECONNECT` in `hook_shot_data.js`.
+
+`send_test_shot.py` follows the same rule: while the putter is out it asks for a putt distance in
+feet, sends a putt-speed shot with a deliberately sloppy side angle, and shows when it was capped.
+
+## Testing without a launch monitor
+
+`send_test_shot.py` sends synthetic shots to Muni Golf without needing SkyTrak or Frida involved
+at all -- useful for testing the network path (or Muni's receiving end) in isolation:
+
+```bash
+./venv/bin/python3 send_test_shot.py              # Muni Golf on 9210
+./venv/bin/python3 send_test_shot.py --port 9211  # if Muni shows a different port
 ```
 
 It prompts for a target yardage and generates plausible (not physically simulated) ball/club
@@ -141,16 +194,15 @@ speed, launch angle, spin, etc. for that distance, tagged with a distinct `Devic
 give it blank input or Ctrl+C.
 
 Note: individual values (speed, launch, spin, side angle) stay realistic, but the requested
-yardage isn't currently a reliable predictor of `automat-lm-bridge`'s own computed carry distance
--- it's only tuned for stat-level realism, not hitting an exact distance.
+yardage isn't a reliable predictor of the game's own computed carry distance -- it's only tuned
+for stat-level realism, not hitting an exact distance.
 
 To test end to end:
 
-1. Start the bridge: `./automat-lm-bridge-v1.9.9b-macos-arm64` (no `sudo` needed).
-2. Open `http://127.0.0.1:9091/` to confirm it's listening.
-3. In another terminal, run `send_test_shot.py` and enter a yardage.
-4. Confirm receipt via the script's own `-> bridge response: ...` line, the bridge's terminal log
-   (`[shot:...] ... → carry ...`), and/or automat.golf itself if it's open.
+1. Open Muni Golf and note the Open Connect port it shows.
+2. Run `send_test_shot.py` (with `--port` if it isn't 9210) and enter a yardage.
+3. Confirm the shot shows up in Muni. Since the script runs with Muni's replies logged, its
+   `[info] receiver: ...` lines also show what Muni sent back.
 
 ## Updating SkyTrak
 
@@ -159,6 +211,13 @@ and walks you through refreshing `SkyTrakInstrumented.app`, as described above.
 
 ## Troubleshooting
 
+- **SkyTrak stops reading shots (often right after a `(no ball data -- not forwarded)` row), but
+  it's still connected**: if it happened after SkyTrak reconnected to the unit, the unit has
+  probably lost its shot mode. The bridge now fixes this automatically (see "Putting side-angle
+  cap" above). If it still happens, pick a different club in Muni and then switch back (or toggle
+  SkyTrak's own putting mode off and on). That makes SkyTrak send the mode to the unit again, so
+  you don't need to restart the app. SkyTrak's own log, `~/Library/Logs/SkyTrak/SKYTRAK/Player.log`,
+  shows reconnects as `RIPE_EVT_BOX_CONNECTED`.
 - **`attach()` hangs for 8+ seconds with a `[warn]` message**: a previous run didn't detach
   cleanly (e.g. was force-killed) and left a broken Frida agent inside SkyTrak's process. Quit
   `SkyTrakInstrumented.app` and relaunch it, then try again.
@@ -167,20 +226,13 @@ and walks you through refreshing `SkyTrakInstrumented.app`, as described above.
   development. Ctrl+C one before starting another.
 - Always let the script exit via Ctrl+C rather than force-killing it (`kill -9`), so it can
   detach cleanly and avoid the two issues above.
-- **Use Chrome, not Safari, for automat.golf.** Safari blocks the `EventSource` connection
-  automat.golf's page makes to `automat-lm-bridge`'s local status endpoint
-  (`http://127.0.0.1:9091/events`) with a console error like `EventSource cannot load ... due to
-  access control checks`. Neither of Safari's Develop-menu "Disable Cross-Origin Restrictions" or
-  "Disable Local File Restrictions" fixes it (this isn't classic CORS -- more likely Safari's
-  stricter enforcement of local-network-access from public HTTPS pages). Confirmed with the
-  automat.golf developer that switching to Chrome resolves it.
 
 ## Repo layout
 
 - `run.command` -- installs prerequisites (if missing), launches `SkyTrakInstrumented.app` (if not
   already running), and starts the bridge; the normal way to run this day to day.
 - `run_hook.py` -- the bridge: attaches to SkyTrak, prints live shot data, forwards valid shots to
-  `automat-lm-bridge`, handles SkyTrak-update/RVA-drift detection.
+  Muni Golf, handles SkyTrak-update/RVA-drift detection.
 - `hook_shot_data.js` -- the Frida script with the actual hooks
   (`SecurityWrapperService.OnShotBallData`/`OnShotEnded`, `ClubHeadData.PredictClubHeadData`) and
   their hardcoded RVAs.

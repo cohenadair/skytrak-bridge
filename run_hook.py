@@ -1,3 +1,4 @@
+import argparse
 import plistlib
 import re
 import shutil
@@ -22,6 +23,24 @@ sys.stdout.reconfigure(line_buffering=True)
 
 PROCESS_NAME = "SKYTRAK"
 
+# Set to True to print a line for every forwarded shot and everything Muni
+# sends back. Left off by default since it interrupts the shot table output.
+DEBUG_ENABLED = False
+
+# When the game (Muni Golf) reports the putter is out, switch SkyTrak itself
+# to putting mode, and back to normal when another club is selected. Only
+# acts when the game's club changes, so you can still override SkyTrak's
+# mode by hand in between. See setPuttingMode() in hook_shot_data.js.
+AUTO_SWITCH_SKYTRAK_PUTTING_MODE = True
+
+# What the bridge is being used with (--software). "muni" forwards shots to
+# Muni Golf over Open Connect; "skytrak" is for using SkyTrak's own app on
+# its own -- shots still print, but nothing is sent anywhere and there's no
+# Muni connection (or Muni-related output) at all.
+SOFTWARE_MUNI = "muni"
+SOFTWARE_SKYTRAK = "skytrak"
+SOFTWARE_CHOICES = (SOFTWARE_MUNI, SOFTWARE_SKYTRAK)
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPT_PATH = SCRIPT_DIR / "hook_shot_data.js"
 APPLICATIONS_SKYTRAK_APP = Path("/Applications/SkyTrak.app")
@@ -34,7 +53,7 @@ IL2CPPDUMPER_BIN = SCRIPT_DIR / "reverse-eng" / "Il2CppDumper" / "publish" / "Il
 # The SkyTrak version hook_shot_data.js's hardcoded RVAs were last verified
 # against. Update this after re-verifying against a newer SkyTrak version
 # (see check_for_skytrak_update() below).
-KNOWN_GOOD_SKYTRAK_VERSION = "5.6.14.6.30.25.9"
+KNOWN_GOOD_SKYTRAK_VERSION = "6.2.111.10.7.26.11"
 
 # MARK: - Shot table output
 
@@ -92,7 +111,8 @@ def print_shot_table_footer():
         print(shot_table_border)
 
 
-def print_shot_table_row(shot_number, ball_speed, club_speed, smash_factor, launch_angle, side_angle, spin_axis, total_spin, valid):
+def print_shot_table_row(shot_number, ball_speed, club_speed, smash_factor, launch_angle, side_angle, spin_axis, total_spin, valid,
+                         sent_side_angle=None, skytrak_side_angle=None, forwarding=True):
     # ball_speed arrives in raw m/s; convert to mph for display only.
     # club_speed (from ClubHeadData) is already mph -- no conversion.
     club_str = "-" if club_speed is None else f"{club_speed:.1f}"
@@ -109,7 +129,18 @@ def print_shot_table_row(shot_number, ball_speed, club_speed, smash_factor, laun
     ]
     row = shot_table_row(values)
     if not valid:
-        row += "  (no ball data -- not forwarded)"
+        row += "  (no ball data -- not forwarded)" if forwarding else "  (no ball data)"
+    else:
+        # The table shows SkyTrak's raw number; note where a putting clamp
+        # changed it -- in what was sent to the game, and/or in what SkyTrak
+        # itself used (hook_shot_data.js clamps it in SkyTrak's putting mode).
+        notes = []
+        if sent_side_angle is not None and sent_side_angle != side_angle:
+            notes.append(f"side sent as {sent_side_angle:.1f}")
+        if skytrak_side_angle is not None and skytrak_side_angle != side_angle:
+            notes.append(f"SkyTrak side set to {skytrak_side_angle:.1f}")
+        if notes:
+            row += f"  (putt: {'; '.join(notes)})"
     print(row)
 
 
@@ -187,31 +218,38 @@ _pending_ball = None  # {"shot_number": int, "payload": dict, "timer": Timer}
 _pending_club = None  # a ClubHeadData payload arrived before its ball data
 _state_lock = threading.Lock()
 
+# Set in main() from --host/--port. None with --software skytrak, where
+# nothing is forwarded.
+_shot_sender = None
 
-def _forward_shot_to_bridge(shot_number, ball_payload, club_speed_mph):
+
+def _forward_shot_to_bridge(shot_number, ball_payload, club_speed_mph, hla):
     json_str = gspro_connect.build_gspro_json(
         shot_number=shot_number,
         ball_speed_mph=mps_to_mph(ball_payload["totalSpeed"]),
         vla=ball_payload["launchAngle"],
-        hla=ball_payload["horizontalAngle"],
+        hla=hla,
         total_spin=ball_payload["totalSpin"],
         spin_axis=ball_payload["spinAxis"],
         club_speed_mph=club_speed_mph,
     )
     try:
-        response = gspro_connect.send_to_bridge(json_str)
-        if response:
-            print(f"[info] bridge response: {response.strip()}")
-        else:
-            print(f"[info] forwarded shot #{shot_number} to bridge (no response)")
+        _shot_sender.send(json_str)
+        if DEBUG_ENABLED:
+            print(f"[info] forwarded shot #{shot_number} to {_shot_sender.address}")
     except OSError as e:
-        print(f"[error] failed to forward shot #{shot_number} to bridge at "
-              f"{gspro_connect.BRIDGE_HOST}:{gspro_connect.BRIDGE_PORT}: {e}")
+        print(f"[error] failed to forward shot #{shot_number} to Muni Golf at "
+              f"{_shot_sender.address}: {e}")
 
 
 def _print_merged_row(shot_number, ball_payload, club_payload):
     valid = is_valid_shot(ball_payload)
     club_speed_mph = club_payload["clubSpeed"] if club_payload else None
+    forwarding = _shot_sender is not None
+    sent_hla = None
+    if forwarding:
+        sent_hla = gspro_connect.cap_putting_side(ball_payload["horizontalAngle"],
+                                                  _shot_sender.player_info)
     print_shot_table_row(
         shot_number=shot_number,
         ball_speed=ball_payload["totalSpeed"],
@@ -222,9 +260,12 @@ def _print_merged_row(shot_number, ball_payload, club_payload):
         spin_axis=ball_payload["spinAxis"],
         total_spin=ball_payload["totalSpin"],
         valid=valid,
+        sent_side_angle=sent_hla,
+        skytrak_side_angle=ball_payload.get("skytrakPuttingSideAngle"),
+        forwarding=forwarding,
     )
-    if valid:
-        _forward_shot_to_bridge(shot_number, ball_payload, club_speed_mph)
+    if valid and forwarding:
+        _forward_shot_to_bridge(shot_number, ball_payload, club_speed_mph, sent_hla)
 
 
 def _on_grace_period_expired(shot_number):
@@ -252,6 +293,21 @@ def on_message(message, data):
         return
 
     label = payload["label"]
+
+    if label == "Reconnected":
+        # SkyTrak reconnected to the unit on its own; the hook is re-sending
+        # the mode SkyTrak thinks it's in (see RVA_ON_CONNECTED in
+        # hook_shot_data.js), since the unit comes back without it.
+        print(f"[info] SkyTrak reconnected to the unit -- re-sending {payload['mode']} mode")
+        return
+
+    if label == "ShotMode":
+        # Reply to a set_putting_mode() request (see sync_skytrak_shot_mode).
+        if payload["result"] == "switched":
+            print(f"[info] Switched from {payload['from']} to {payload['mode']}")
+        elif payload["result"] != "already set":
+            print(f"[info] SkyTrak {payload['mode']} mode: {payload['result']}")
+        return
 
     if label == "ClubHeadData":
         with _state_lock:
@@ -294,6 +350,27 @@ def on_message(message, data):
         _print_merged_row(stale["shot_number"], stale["payload"], None)
     if club_payload is not None:
         _print_merged_row(shot_number, payload, club_payload)
+
+
+_last_synced_putting = None
+
+
+def sync_skytrak_shot_mode(script):
+    """Asks the hook to switch SkyTrak's shot mode when the game's selected
+    club changes to or from the putter. Does nothing until the game has
+    reported a club."""
+    global _last_synced_putting
+    player_info = _shot_sender.player_info
+    if not player_info or "Club" not in player_info:
+        return
+    putting = gspro_connect.is_putting(player_info)
+    if putting == _last_synced_putting:
+        return
+    _last_synced_putting = putting
+    try:
+        script.exports_sync.set_putting_mode(putting)
+    except Exception as e:
+        print(f"[error] couldn't switch SkyTrak's shot mode: {e!r}")
 
 
 def on_detached(reason, crash):
@@ -379,9 +456,26 @@ def refresh_instrumented_app():
 # Method -> (containing class, signature to locate it by). Keep in sync with
 # the RVA_* constants hook_shot_data.js actually hooks.
 RVA_TARGETS = {
-    "RVA_ON_SHOT_BALL_DATA": ("SecurityWrapperService", "private void OnShotBallData(STSWShotParamsType shotParams)"),
-    "RVA_ON_SHOT_ENDED": ("SecurityWrapperService", "private void OnShotEnded(STSWShotParamsType shotParams)"),
+    "RVA_ON_SHOT_BALL_DATA": ("SecurityWrapperService", "private void OnShotBallData(STSWFullShotParamsType shotParams)"),
+    "RVA_ON_SHOT_ENDED": ("SecurityWrapperService", "private void OnShotEnded(STSWFullShotParamsType shotParams)"),
     "RVA_PREDICT_CLUB_HEAD_DATA": ("ClubHeadData", "public void PredictClubHeadData(TFlightData flightData, string clubType, bool isPracticeMode)"),
+    "RVA_GET_IS_MODE_PUTTING": ("SecurityWrapperService", "public bool get_IsModePutting()"),
+    "RVA_GET_SKYTRAK_SW_INSTANCE": ("SecurityWrapperService", "public static ISkyTrakSW get_Instance()"),
+    "RVA_SET_SHOT_MODE_PUTTING": ("SecurityWrapperService", "private void Security.ISkyTrakSW.SetShotModePutting()"),
+    "RVA_SET_SHOT_MODE_NORMAL": ("SecurityWrapperService", "private void Security.ISkyTrakSW.SetShotModeNormal()"),
+    "RVA_PLAYER_LOOP_RUNNER_RUN": ("PlayerLoopRunner", "public void Run()"),
+    "RVA_ON_CONNECTED": ("SecurityWrapperService", "private void OnConnected()"),
+}
+
+# Field-offset constant -> (containing class, field name). Keep in sync with
+# the *_OFFSET constants hook_shot_data.js reads. (SkyTrak 6.x moved
+# ClubHeadData's fields without moving any hooked method's signature, so an
+# RVA-only check isn't enough.)
+FIELD_OFFSET_TARGETS = {
+    "CLUB_HEAD_DATA_CLUB_SPEED_OFFSET": ("ClubHeadData", "ClubSpeed"),
+    "CLUB_HEAD_DATA_SMASH_FACTOR_OFFSET": ("ClubHeadData", "SmashFactor"),
+    "SECURITY_WRAPPER_CURRENT_SHOT_MODE_OFFSET": ("SecurityWrapperService", "_currentShotModeType"),
+    "SECURITY_WRAPPER_TARGET_SHOT_MODE_OFFSET": ("SecurityWrapperService", "_targetShotModeType"),
 }
 
 _RVA_CONST_PATTERN = re.compile(r'const\s+(RVA_\w+)\s*=\s*(0x[0-9A-Fa-f]+)')
@@ -393,12 +487,20 @@ _CLASS_PATTERN_TEMPLATE = r'^\s*(?:public |internal |private )?(?:sealed |abstra
 _RVA_COMMENT_PATTERN = re.compile(r'RVA:\s*(0x[0-9A-Fa-f]+)')
 
 
+_OFFSET_CONST_PATTERN = re.compile(r'const\s+(\w+_OFFSET)\s*=\s*(0x[0-9A-Fa-f]+)')
+
+
 def read_hardcoded_rvas():
     source = SCRIPT_PATH.read_text()
     return {name: int(value, 16) for name, value in _RVA_CONST_PATTERN.findall(source)}
 
 
-def find_method_rva(dump_text, class_name, signature):
+def read_hardcoded_field_offsets():
+    source = SCRIPT_PATH.read_text()
+    return {name: int(value, 16) for name, value in _OFFSET_CONST_PATTERN.findall(source)}
+
+
+def find_class_body(dump_text, class_name):
     # Il2CppDumper flattens nested types into separate top-level entries, so
     # a class's body never contains another class's braces -- the first
     # standalone "}" on its own line reliably closes it.
@@ -409,7 +511,21 @@ def find_method_rva(dump_text, class_name, signature):
     body_end = dump_text.find("\n}\n", class_match.end())
     if body_end == -1:
         return None
-    class_body = dump_text[class_match.end():body_end]
+    return dump_text[class_match.end():body_end]
+
+
+def find_field_offset(dump_text, class_name, field_name):
+    class_body = find_class_body(dump_text, class_name)
+    if class_body is None:
+        return None
+    match = re.search(rf'^\s*[^\n;]*\s{re.escape(field_name)}; // (0x[0-9A-Fa-f]+)$', class_body, re.MULTILINE)
+    return int(match.group(1), 16) if match else None
+
+
+def find_method_rva(dump_text, class_name, signature):
+    class_body = find_class_body(dump_text, class_name)
+    if class_body is None:
+        return None
 
     sig_index = class_body.find(signature)
     if sig_index == -1:
@@ -427,16 +543,23 @@ def check_rva_drift():
               "skipping RVA verification. See README.md to build it.")
         return
 
-    print("[info] thinning GameAssembly.dylib to arm64...")
-    lipo = subprocess.run(
-        ["lipo", "-thin", "arm64",
-         str(INSTRUMENTED_APP / "Contents" / "Frameworks" / "GameAssembly.dylib"),
-         "-output", str(GAME_ASSEMBLY_ARM64)],
-        capture_output=True, text=True,
-    )
-    if lipo.returncode != 0:
-        print(f"[error] lipo failed, skipping RVA verification: {lipo.stderr}")
-        return
+    game_assembly = INSTRUMENTED_APP / "Contents" / "Frameworks" / "GameAssembly.dylib"
+    # SkyTrak 5.x shipped a universal (x86_64 + arm64) GameAssembly.dylib
+    # that needs thinning; 6.x ships arm64-only, which `lipo -thin` rejects
+    # ("must be a fat file"), so just copy it as-is in that case.
+    lipo_info = subprocess.run(["lipo", "-info", str(game_assembly)], capture_output=True, text=True)
+    if lipo_info.stdout.startswith("Non-fat"):
+        print("[info] GameAssembly.dylib is already arm64-only, copying...")
+        shutil.copyfile(game_assembly, GAME_ASSEMBLY_ARM64)
+    else:
+        print("[info] thinning GameAssembly.dylib to arm64...")
+        lipo = subprocess.run(
+            ["lipo", "-thin", "arm64", str(game_assembly), "-output", str(GAME_ASSEMBLY_ARM64)],
+            capture_output=True, text=True,
+        )
+        if lipo.returncode != 0:
+            print(f"[error] lipo failed, skipping RVA verification: {lipo.stderr}")
+            return
 
     print("[info] running Il2CppDumper (this can take a minute)...")
     if DUMP_DIR.exists():
@@ -479,12 +602,29 @@ def check_rva_drift():
         else:
             print(f"  {const_name}: unchanged (0x{old_rva:X})")
 
+    hardcoded_offsets = read_hardcoded_field_offsets()
+    for const_name, (class_name, field_name) in FIELD_OFFSET_TARGETS.items():
+        new_offset = find_field_offset(dump_text, class_name, field_name)
+        old_offset = hardcoded_offsets.get(const_name)
+        if new_offset is None:
+            print(f"  {const_name}: could not find field {class_name}.{field_name} in "
+                  "the new dump -- check hook_shot_data.js manually")
+            any_changed = True
+        elif old_offset is None:
+            print(f"  {const_name}: not defined in hook_shot_data.js to compare against")
+        elif new_offset != old_offset:
+            print(f"  {const_name}: CHANGED old=0x{old_offset:X} new=0x{new_offset:X} "
+                  "-- update hook_shot_data.js")
+            any_changed = True
+        else:
+            print(f"  {const_name}: unchanged (0x{old_offset:X})")
+
     if any_changed:
         print("[warn] one or more RVAs changed or couldn't be verified -- "
               "hook_shot_data.js needs manual review before this bridge can "
               "be trusted on this SkyTrak version.")
     else:
-        print("[info] all RVAs match -- hook_shot_data.js should still be valid.")
+        print("[info] all RVAs and field offsets match -- hook_shot_data.js should still be valid.")
 
 
 def check_for_skytrak_update():
@@ -527,9 +667,29 @@ def check_for_skytrak_update():
 
 
 def main():
-    global _active_session
+    global _active_session, _shot_sender
+
+    parser = argparse.ArgumentParser(description="Forward SkyTrak shots over GSPro Open Connect.")
+    parser.add_argument("--software", choices=SOFTWARE_CHOICES, default=SOFTWARE_MUNI,
+                        help="what you're playing with: 'muni' forwards shots to Muni Golf; "
+                             "'skytrak' is SkyTrak's own app only -- shots still print, but "
+                             "nothing is forwarded and there's no Muni output "
+                             f"(default: {SOFTWARE_MUNI})")
+    gspro_connect.add_receiver_arguments(parser)
+    args = parser.parse_args()
+    using_muni = args.software == SOFTWARE_MUNI
 
     check_for_skytrak_update()
+
+    if using_muni:
+        print(f"[info] sending shots to Muni Golf at {args.host}:{args.port}")
+        _shot_sender = gspro_connect.ShotSender(host=args.host, port=args.port,
+                                                verbose=DEBUG_ENABLED)
+        if not _shot_sender.wait_until_connected(timeout=2):
+            print("[warn] not connected yet -- shots will be dropped until the game is open "
+                  "(it'll keep retrying in the background)")
+    else:
+        print("[info] SkyTrak app only -- shots won't be forwarded anywhere")
 
     print("[info] enumerating processes...")
     device = frida.get_local_device()
@@ -562,7 +722,9 @@ def main():
     install_shot_table_termination_handler()
 
     while True:
-        time.sleep(1)
+        if using_muni and AUTO_SWITCH_SKYTRAK_PUTTING_MODE:
+            sync_skytrak_shot_mode(script)
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":

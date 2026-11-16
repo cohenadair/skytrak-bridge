@@ -49,9 +49,21 @@ else
     echo "[setup] Setting up Python virtual environment..."
     rm -rf venv
     "$PYTHON312" -m venv venv
-    ./venv/bin/pip install --upgrade pip -q
+    ./venv/bin/python3 -m pip install --upgrade pip -q
     echo "[setup] Installing frida-tools..."
-    ./venv/bin/pip install frida-tools -q
+    ./venv/bin/python3 -m pip install frida-tools -q
+fi
+
+# With Frida 17.16.4, SkyTrak 6.x crashes (EXC_BAD_ACCESS in
+# _Unwind_RaiseException, jumping into freed Frida memory) a few seconds
+# after the bridge detaches. 17.26.2 was verified not to, so upgrade any
+# existing venv below that.
+MIN_FRIDA="17.26.2"
+if ! ./venv/bin/python3 -c "import frida,sys; v=tuple(map(int,frida.__version__.split('.')[:3])); sys.exit(v < tuple(map(int,'$MIN_FRIDA'.split('.'))))" >/dev/null 2>&1; then
+    echo "[setup] Upgrading Frida to >= $MIN_FRIDA..."
+    ./venv/bin/python3 -m pip install -q -U "frida>=$MIN_FRIDA" frida-tools
+else
+    echo "[setup] Frida is >= $MIN_FRIDA, skipping upgrade."
 fi
 
 # --- SkyTrakInstrumented.app ---
@@ -80,4 +92,4 @@ fi
 echo ""
 echo "=== Starting bridge ==="
 echo ""
-exec ./venv/bin/python3 run_hook.py
+exec ./venv/bin/python3 run_hook.py "$@"

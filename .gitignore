@@ -6,9 +6,6 @@ __pycache__/
 # macOS
 .DS_Store
 
-# Third-party binary, not ours to version -- re-download as needed
-automat-lm-bridge-v*
-
 # Session/tooling metadata, not project source
 .claude/
 
