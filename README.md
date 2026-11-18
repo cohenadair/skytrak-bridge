@@ -36,8 +36,8 @@ Golf is implemented to the Open Connect spec but not yet verified against the ga
 ## One-time setup (contributing)
 
 ```bash
-git clone git@github.com:cohenadair/skytrak-gspro-connect-bridge.git
-cd skytrak-gspro-connect-bridge
+git clone git@github.com:cohenadair/skytrak-bridge.git
+cd skytrak-bridge
 ./run.command
 ```
 
