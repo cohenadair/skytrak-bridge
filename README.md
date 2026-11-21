@@ -8,24 +8,24 @@ Speaks the [GSPro Open Connect](https://gsprogolf.com/GSProConnectV1.html) proto
 to **[Muni Golf](https://munigolfsim.com)** -- a native Mac golf sim that listens for Open Connect
 launch monitors on the port it shows in-game (9210 unless you change it). The bridge keeps one
 connection open with periodic heartbeats, like real launch monitor software does, and reconnects
-automatically if the game is closed/reopened.
+automatically if the game is closed/reopened. Forwarding to Muni is opt-in (`--software muni`);
+by default the bridge just works alongside SkyTrak's own app.
 
 **Status:** live shot capture works and prints to a table in your terminal. Forwarding to Muni
 Golf is implemented to the Open Connect spec but not yet verified against the game itself.
 
 ## TL;DR
 
-1. Open Muni Golf and note the Open Connect port it shows (9210 by default).
-2. Double-click **`run.command`** (or run `./run.command` in a terminal). It installs anything it
+1. Double-click **`run.command`** (or run `./run.command` in a terminal). It installs anything it
    needs (Homebrew, Python, the venv, `frida-tools`), launches `SkyTrakInstrumented.app` if it's
    not already running, and starts the bridge -- on a first run it'll also offer to set up
    `SkyTrakInstrumented.app` itself, answer `y`. See one-time setup below if anything about that
-   needs more explanation. If Muni uses a port other than 9210, run `./run.command --port <port>`.
-   Using the SkyTrak app on its own, without Muni? Run `./run.command --software skytrak` instead
-   (see "Using SkyTrak's app on its own" below).
-3. Connect your SkyTrak LM to the app as usual.
-4. Hit balls. Shots print live in your terminal and forward automatically to Muni Golf.
-5. Press Ctrl+C in the terminal window to stop the bridge.
+   needs more explanation. By default this is SkyTrak's own app only -- nothing is forwarded.
+   Playing Muni Golf? Open it first, then run `./run.command --software muni` instead (add
+   `--port <port>` if Muni's Open Connect port isn't 9210; see "Forwarding to Muni Golf" below).
+2. Connect your SkyTrak LM to the app as usual.
+3. Hit balls. Shots print live in your terminal (and forward to Muni Golf with `--software muni`).
+4. Press Ctrl+C in the terminal window to stop the bridge.
 
 ## Requirements
 
@@ -119,11 +119,10 @@ dotnet publish reverse-eng/Il2CppDumper/Il2CppDumper/Il2CppDumper.csproj \
 
 ## Using SkyTrak's app on its own
 
-By default the bridge assumes you're playing Muni Golf (`--software muni`). If you're only using
-SkyTrak's own app, run:
+This is the default (`--software skytrak`), so just run:
 
 ```bash
-./run.command --software skytrak
+./run.command
 ```
 
 Shots still print in the table, and the SkyTrak-side putting fixes still apply (the side-angle
@@ -134,7 +133,7 @@ to follow Muni's club. Bad reads show as `(no ball data)`, without the "not forw
 
 ## Forwarding to Muni Golf
 
-Each valid shot is sent as GSPro Open Connect JSON to Muni Golf at `127.0.0.1:9210`
+Forwarding is off by default; run `./run.command --software muni` to turn it on. Each valid shot is sent as GSPro Open Connect JSON to Muni Golf at `127.0.0.1:9210`
 over a single long-lived connection, with a heartbeat (`IsHeartBeat: true`,
 `LaunchMonitorIsReady: true`) every 5 seconds so the game sees the launch monitor as connected and
 ready. If the game isn't running yet, the bridge prints a warning once and keeps retrying in the
@@ -232,7 +231,7 @@ and walks you through refreshing `SkyTrakInstrumented.app`, as described above.
 - `run.command` -- installs prerequisites (if missing), launches `SkyTrakInstrumented.app` (if not
   already running), and starts the bridge; the normal way to run this day to day.
 - `run_hook.py` -- the bridge: attaches to SkyTrak, prints live shot data, forwards valid shots to
-  Muni Golf, handles SkyTrak-update/RVA-drift detection.
+  Muni Golf (with `--software muni`), handles SkyTrak-update/RVA-drift detection.
 - `hook_shot_data.js` -- the Frida script with the actual hooks
   (`SecurityWrapperService.OnShotBallData`/`OnShotEnded`, `ClubHeadData.PredictClubHeadData`) and
   their hardcoded RVAs.

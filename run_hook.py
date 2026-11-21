@@ -670,11 +670,11 @@ def main():
     global _active_session, _shot_sender
 
     parser = argparse.ArgumentParser(description="Forward SkyTrak shots over GSPro Open Connect.")
-    parser.add_argument("--software", choices=SOFTWARE_CHOICES, default=SOFTWARE_MUNI,
+    parser.add_argument("--software", choices=SOFTWARE_CHOICES, default=SOFTWARE_SKYTRAK,
                         help="what you're playing with: 'muni' forwards shots to Muni Golf; "
                              "'skytrak' is SkyTrak's own app only -- shots still print, but "
                              "nothing is forwarded and there's no Muni output "
-                             f"(default: {SOFTWARE_MUNI})")
+                             f"(default: {SOFTWARE_SKYTRAK})")
     gspro_connect.add_receiver_arguments(parser)
     args = parser.parse_args()
     using_muni = args.software == SOFTWARE_MUNI
